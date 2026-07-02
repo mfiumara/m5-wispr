@@ -973,6 +973,8 @@ dependencies = [
 [[package]]
 name = "m5unified"
 version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9552867230fc24ab7695ada27a982d4d36b98e900b5c54a487c848ebc6bf79d9"
 dependencies = [
  "m5unified-sys",
 ]
@@ -980,6 +982,8 @@ dependencies = [
 [[package]]
 name = "m5unified-sys"
 version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97f5d9e9eb04af3c4c2bb88ea3c005f34f6d93ce87476bc41ec8871b6f90105a"
 
 [[package]]
 name = "memchr"

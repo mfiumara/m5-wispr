@@ -1,5 +1,7 @@
 # M5 Wispr BLE Mic
 
+[![CI](https://github.com/mfiumara/m5-wispr/actions/workflows/ci.yml/badge.svg)](https://github.com/mfiumara/m5-wispr/actions/workflows/ci.yml)
+
 Rust ESP-IDF firmware for an M5StickS3 that behaves as a push-to-talk BLE remote for Wispr Flow.
 
 Behavior:
@@ -41,6 +43,34 @@ byte  8      bits_per_sample
 byte  9      channels
 bytes 10..12 samples_per_packet u16 little-endian
 bytes 12..16 stream_header_bytes u32 little-endian
+```
+
+## Wispr Flow Setup
+
+This project uses two paths into Wispr Flow:
+
+- BLE HID keyboard: the M5StickS3 holds `Right Option` while Button A is held.
+- BLE PCM audio: the custom macOS bridge sends the M5 audio stream into a CoreAudio loopback device that Wispr Flow can select as a microphone.
+
+Recommended macOS setup:
+
+1. Install a CoreAudio loopback device such as BlackHole 2ch.
+2. Build and flash the firmware onto the M5StickS3.
+3. Pair `m5sticks3` in macOS System Settings > Bluetooth.
+4. Configure Wispr Flow push-to-talk to use `Option` as the hold key.
+5. Configure Wispr Flow microphone input to the BlackHole input.
+6. Run the bridge and point it at the matching BlackHole output:
+
+```bash
+swift run --package-path macos-bridge m5-wispr-bridge --audio-device "BlackHole 2ch"
+```
+
+7. Hold Button A on the M5StickS3. The bridge should receive BLE PCM audio, play it into BlackHole, and Wispr Flow should see that audio on the BlackHole input while the Option hotkey is held.
+
+If the bridge cannot scan or connect, grant Bluetooth access to the terminal app in System Settings > Privacy & Security > Bluetooth. If Wispr Flow sees the hotkey but no audio, verify the bridge can see BlackHole:
+
+```bash
+swift run --package-path macos-bridge m5-wispr-bridge --list-audio-devices
 ```
 
 ## Build

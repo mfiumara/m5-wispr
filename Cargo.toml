@@ -10,7 +10,7 @@ esp-idf-sys = { version = "0.37.2", default-features = false, features = ["std",
 esp-idf-svc = { version = "0.52.1", default-features = false, features = ["std", "embassy-sync"] }
 esp32-nimble = "0.12.0"
 log = "0.4"
-m5unified = { path = "../m5unified-rs/crates/m5unified" }
+m5unified = "0.3.8"
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }

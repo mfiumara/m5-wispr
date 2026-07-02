@@ -1,5 +1,39 @@
-# Reuse the sibling m5unified-rs native shim as an ESP-IDF component.
-set(M5UNIFIED_RS_NATIVE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../m5unified-rs/crates/m5unified-sys/native")
+set(M5UNIFIED_RS_CRATE_VERSION "0.3.8")
+set(M5UNIFIED_RS_NATIVE_DIR "" CACHE PATH "Path to the m5unified-sys/native component directory")
+
+if(NOT M5UNIFIED_RS_NATIVE_DIR)
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+    get_filename_component(M5_WISPR_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+    execute_process(
+        COMMAND "${CARGO_EXECUTABLE}" metadata --format-version 1 --locked
+        WORKING_DIRECTORY "${M5_WISPR_ROOT}"
+        RESULT_VARIABLE M5UNIFIED_RS_METADATA_RESULT
+        OUTPUT_VARIABLE M5UNIFIED_RS_METADATA_JSON
+        ERROR_VARIABLE M5UNIFIED_RS_METADATA_ERROR
+    )
+    if(NOT M5UNIFIED_RS_METADATA_RESULT EQUAL 0)
+        message(FATAL_ERROR "cargo metadata failed while locating m5unified-sys: ${M5UNIFIED_RS_METADATA_ERROR}")
+    endif()
+
+    string(JSON M5UNIFIED_RS_PACKAGE_COUNT LENGTH "${M5UNIFIED_RS_METADATA_JSON}" packages)
+    math(EXPR M5UNIFIED_RS_PACKAGE_LAST "${M5UNIFIED_RS_PACKAGE_COUNT} - 1")
+    foreach(M5UNIFIED_RS_PACKAGE_INDEX RANGE 0 ${M5UNIFIED_RS_PACKAGE_LAST})
+        string(JSON M5UNIFIED_RS_PACKAGE_NAME GET "${M5UNIFIED_RS_METADATA_JSON}" packages ${M5UNIFIED_RS_PACKAGE_INDEX} name)
+        string(JSON M5UNIFIED_RS_PACKAGE_VERSION GET "${M5UNIFIED_RS_METADATA_JSON}" packages ${M5UNIFIED_RS_PACKAGE_INDEX} version)
+        if(M5UNIFIED_RS_PACKAGE_NAME STREQUAL "m5unified-sys" AND M5UNIFIED_RS_PACKAGE_VERSION STREQUAL "${M5UNIFIED_RS_CRATE_VERSION}")
+            string(JSON M5UNIFIED_RS_MANIFEST_PATH GET "${M5UNIFIED_RS_METADATA_JSON}" packages ${M5UNIFIED_RS_PACKAGE_INDEX} manifest_path)
+            get_filename_component(M5UNIFIED_RS_CRATE_DIR "${M5UNIFIED_RS_MANIFEST_PATH}" DIRECTORY)
+            set(M5UNIFIED_RS_NATIVE_DIR "${M5UNIFIED_RS_CRATE_DIR}/native")
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(NOT EXISTS "${M5UNIFIED_RS_NATIVE_DIR}/m5u_shim.cpp")
+    message(FATAL_ERROR "Could not find m5unified-sys ${M5UNIFIED_RS_CRATE_VERSION} native shim at '${M5UNIFIED_RS_NATIVE_DIR}'")
+endif()
+
+message(STATUS "Using m5unified-sys native shim: ${M5UNIFIED_RS_NATIVE_DIR}")
 
 set(M5UNIFIED_RS_COMPONENT_REQUIRES
     M5Unified
