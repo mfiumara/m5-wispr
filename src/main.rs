@@ -37,6 +37,8 @@ const WISPR_HOTKEY_MODIFIERS: u8 = HID_MOD_RIGHT_OPTION;
 const DISPLAY_BRIGHTNESS: u8 = 96;
 const BATTERY_DISPLAY_MS: u64 = 2_500;
 const BATTERY_REFRESH_MS: u64 = 1_000;
+const BATTERY_CHARGING_REFRESH_MS: u64 = 250;
+const BATTERY_CHARGING_SWEEP_STEPS: i32 = 12;
 const IDLE_LOOP_MS: u32 = 20;
 
 // The recording animation is a pre-rendered gif: portrait full-screen frames
@@ -47,8 +49,7 @@ const RECORDING_GIF_WIDTH: i32 = 135;
 const RECORDING_GIF_HEIGHT: i32 = 240;
 const RECORDING_GIF_FRAME_COUNT: usize = 16;
 const RECORDING_GIF_FRAME_MS: u64 = 130;
-const RECORDING_GIF_FRAME_PIXELS: usize =
-    (RECORDING_GIF_WIDTH * RECORDING_GIF_HEIGHT) as usize;
+const RECORDING_GIF_FRAME_PIXELS: usize = (RECORDING_GIF_WIDTH * RECORDING_GIF_HEIGHT) as usize;
 const RECORDING_GIF_BYTES: usize = RECORDING_GIF_FRAME_COUNT * RECORDING_GIF_FRAME_PIXELS * 2;
 
 #[repr(align(2))]
@@ -62,9 +63,7 @@ fn recording_gif_frame(index: usize) -> &'static [u16] {
     let bytes = &RECORDING_GIF.0[start..start + RECORDING_GIF_FRAME_PIXELS * 2];
     // Safety: the backing static is align(2) and every frame offset is even, so
     // the bytes reinterpret cleanly as native u16 pixels.
-    unsafe {
-        core::slice::from_raw_parts(bytes.as_ptr().cast::<u16>(), RECORDING_GIF_FRAME_PIXELS)
-    }
+    unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<u16>(), RECORDING_GIF_FRAME_PIXELS) }
 }
 
 struct RecordingGifPlayer {
@@ -280,8 +279,11 @@ fn main() -> Result<()> {
     let mut samples = [0_i16; AUDIO_SAMPLES_PER_PACKET];
     let mut recording = false;
     let mut pending_start_flag = false;
-    let mut battery_visible_until: Option<Instant> = None;
+    let mut battery_screen_visible = false;
+    let mut battery_hide_at: Option<Instant> = None;
     let mut last_battery_refresh = Instant::now() - Duration::from_secs(60);
+    let mut battery_charge_frame = 0_u8;
+    let mut last_battery_level: Option<Option<u8>> = None;
     let mut gif_player = RecordingGifPlayer::new(Instant::now());
 
     loop {
@@ -291,7 +293,9 @@ fn main() -> Result<()> {
         if pressed && !recording {
             recording = true;
             pending_start_flag = true;
-            battery_visible_until = None;
+            battery_screen_visible = false;
+            battery_hide_at = None;
+            last_battery_level = None;
             gif_player.reset(Instant::now());
             ble.set_hotkey(true);
             wake_display(&mut m5);
@@ -309,10 +313,16 @@ fn main() -> Result<()> {
             m5.mic.end();
             ble.send_stop_marker();
             ble.set_hotkey(false);
-            render_battery(&mut m5, &mut ble)?;
-            battery_visible_until =
-                Some(Instant::now() + Duration::from_millis(BATTERY_DISPLAY_MS));
-            last_battery_refresh = Instant::now();
+            let now = Instant::now();
+            let (charging, level) = render_battery(&mut m5, &mut ble, battery_charge_frame)?;
+            last_battery_level = Some(level);
+            battery_screen_visible = true;
+            battery_hide_at = if charging {
+                None
+            } else {
+                Some(now + Duration::from_millis(BATTERY_DISPLAY_MS))
+            };
+            last_battery_refresh = now;
         }
 
         if recording {
@@ -336,18 +346,15 @@ fn main() -> Result<()> {
             continue;
         }
 
-        if let Some(until) = battery_visible_until {
-            let now = Instant::now();
-            if now >= until {
-                sleep_display(&mut m5);
-                battery_visible_until = None;
-            } else if now.duration_since(last_battery_refresh)
-                >= Duration::from_millis(BATTERY_REFRESH_MS)
-            {
-                render_battery(&mut m5, &mut ble)?;
-                last_battery_refresh = now;
-            }
-        }
+        refresh_battery_screen(
+            &mut m5,
+            &mut ble,
+            &mut battery_screen_visible,
+            &mut battery_hide_at,
+            &mut last_battery_refresh,
+            &mut battery_charge_frame,
+            &mut last_battery_level,
+        )?;
 
         // Keep the idle path light; BLE advertising and connections run in host tasks.
         FreeRtos::delay_ms(IDLE_LOOP_MS);
@@ -415,22 +422,176 @@ fn render_recording_frame(m5: &mut M5Unified, frame: usize) -> Result<()> {
     Ok(())
 }
 
-fn render_battery(m5: &mut M5Unified, ble: &mut BlePeripherals) -> Result<()> {
-    wake_display(m5);
-    let level = m5.power.battery_level();
-    ble.set_battery_level(level);
+fn refresh_battery_screen(
+    m5: &mut M5Unified,
+    ble: &mut BlePeripherals,
+    visible: &mut bool,
+    hide_at: &mut Option<Instant>,
+    last_refresh: &mut Instant,
+    charge_frame: &mut u8,
+    last_level: &mut Option<Option<u8>>,
+) -> Result<()> {
+    let now = Instant::now();
+    let charging = battery_charging_indicator_active(m5);
 
+    if charging {
+        *hide_at = None;
+    } else if *visible && hide_at.is_none() {
+        *hide_at = Some(now + Duration::from_millis(BATTERY_DISPLAY_MS));
+    }
+
+    if !*visible {
+        if charging {
+            *charge_frame = charge_frame.wrapping_add(1);
+            let (still_charging, level) = render_battery(m5, ble, *charge_frame)?;
+            *visible = true;
+            *last_level = Some(level);
+            *hide_at = if still_charging {
+                None
+            } else {
+                Some(now + Duration::from_millis(BATTERY_DISPLAY_MS))
+            };
+            *last_refresh = now;
+        }
+        return Ok(());
+    }
+
+    if let Some(until) = *hide_at {
+        if now >= until && !charging {
+            sleep_display(m5);
+            *visible = false;
+            *hide_at = None;
+            *last_level = None;
+            return Ok(());
+        }
+    }
+
+    let refresh_ms = if charging {
+        BATTERY_CHARGING_REFRESH_MS
+    } else {
+        BATTERY_REFRESH_MS
+    };
+
+    if now.duration_since(*last_refresh) >= Duration::from_millis(refresh_ms) {
+        if charging {
+            *charge_frame = charge_frame.wrapping_add(1);
+        }
+        let still_charging = if charging {
+            update_battery_charge_fill(m5, ble, *charge_frame, last_level)?
+        } else {
+            let (still_charging, level) = render_battery(m5, ble, *charge_frame)?;
+            *last_level = Some(level);
+            still_charging
+        };
+        *hide_at = if still_charging {
+            None
+        } else if hide_at.is_some() {
+            *hide_at
+        } else {
+            Some(now + Duration::from_millis(BATTERY_DISPLAY_MS))
+        };
+        *last_refresh = now;
+    }
+
+    Ok(())
+}
+
+fn battery_charging_indicator_active(m5: &M5Unified) -> bool {
+    m5.power.vbus_voltage_mv().map_or(false, |mv| mv >= 4_000) || m5.power.is_charging()
+}
+
+struct BatteryLayout {
+    width: i32,
+    body_x: i32,
+    body_y: i32,
+    body_w: i32,
+    body_h: i32,
+}
+
+fn battery_layout(m5: &M5Unified) -> BatteryLayout {
     let width = m5.display.width();
     let height = m5.display.height();
-    let pct = level.unwrap_or(0).min(100);
-    let charging = m5.power.is_charging();
-
     let body_w = (width - 48).max(72);
     let body_h = 34;
     let body_x = (width - body_w) / 2 - 6;
     let body_y = height / 2 - 18;
-    let fill_w = ((body_w - 8) * pct as i32) / 100;
-    let fill_color = if pct <= 20 {
+
+    BatteryLayout {
+        width,
+        body_x,
+        body_y,
+        body_w,
+        body_h,
+    }
+}
+
+fn render_battery(
+    m5: &mut M5Unified,
+    ble: &mut BlePeripherals,
+    charge_frame: u8,
+) -> Result<(bool, Option<u8>)> {
+    wake_display(m5);
+    let level = m5.power.battery_level();
+    ble.set_battery_level(level);
+
+    let layout = battery_layout(m5);
+    let charging = battery_charging_indicator_active(m5);
+
+    m5.display.draw_round_rect(
+        layout.body_x,
+        layout.body_y,
+        layout.body_w,
+        layout.body_h,
+        6,
+        colors::WHITE,
+    );
+    m5.display.fill_round_rect(
+        layout.body_x + layout.body_w,
+        layout.body_y + layout.body_h / 4,
+        8,
+        layout.body_h / 2,
+        3,
+        colors::WHITE,
+    );
+    draw_battery_contents(m5, &layout, level, charging, charge_frame, true)?;
+
+    Ok((charging, level))
+}
+
+fn update_battery_charge_fill(
+    m5: &mut M5Unified,
+    ble: &mut BlePeripherals,
+    frame: u8,
+    last_level: &mut Option<Option<u8>>,
+) -> Result<bool> {
+    let level = m5.power.battery_level();
+    ble.set_battery_level(level);
+    let charging = battery_charging_indicator_active(m5);
+    let layout = battery_layout(m5);
+    let redraw_text = *last_level != Some(level);
+
+    draw_battery_contents(m5, &layout, level, charging, frame, redraw_text)?;
+    *last_level = Some(level);
+    Ok(charging)
+}
+
+fn draw_battery_contents(
+    m5: &mut M5Unified,
+    layout: &BatteryLayout,
+    level: Option<u8>,
+    charging: bool,
+    charge_frame: u8,
+    redraw_text: bool,
+) -> Result<()> {
+    let pct = level.unwrap_or(0).min(100);
+    let displayed_pct = if charging {
+        charging_sweep_pct(pct, charge_frame)
+    } else {
+        pct as i32
+    };
+    let fill_color = if charging {
+        colors::GREEN
+    } else if pct <= 20 {
         colors::RED
     } else if pct <= 50 {
         colors::ORANGE
@@ -438,46 +599,47 @@ fn render_battery(m5: &mut M5Unified, ble: &mut BlePeripherals) -> Result<()> {
         colors::GREEN
     };
 
-    m5.display.fill_screen(colors::BLACK);
+    let inner_x = layout.body_x + 4;
+    let inner_y = layout.body_y + 4;
+    let inner_w = layout.body_w - 8;
+    let inner_h = layout.body_h - 8;
+    let fill_w = (inner_w * displayed_pct) / 100;
+
     m5.display
-        .draw_round_rect(body_x, body_y, body_w, body_h, 6, colors::WHITE);
-    m5.display.fill_round_rect(
-        body_x + body_w,
-        body_y + body_h / 4,
-        8,
-        body_h / 2,
-        3,
-        colors::WHITE,
-    );
+        .fill_rect(inner_x, inner_y, inner_w, inner_h, colors::BLACK);
     if fill_w > 0 {
         m5.display
-            .fill_rect(body_x + 4, body_y + 4, fill_w, body_h - 8, fill_color);
+            .fill_rect(inner_x, inner_y, fill_w, inner_h, fill_color);
     }
 
-    m5.display.set_text_color(colors::WHITE, colors::BLACK);
-    m5.display.set_text_size(3);
-    let pct_text = if level.is_some() {
-        format!("{pct}%")
-    } else {
-        "--%".to_owned()
-    };
-    m5.display.set_cursor(width / 2 - 36, body_y - 38);
-    m5.display.println(&pct_text)?;
-
-    m5.display.set_text_size(1);
-    m5.display.set_cursor(8, height - 18);
-    let voltage = m5
-        .power
-        .battery_voltage_mv()
-        .map(|mv| format!("{:.2}V", mv as f32 / 1000.0))
-        .unwrap_or_else(|| "battery voltage n/a".to_owned());
-    if charging {
-        m5.display.println(&format!("{voltage} charging"))?;
-    } else {
-        m5.display.println(&voltage)?;
+    if redraw_text {
+        m5.display
+            .fill_rect(0, layout.body_y - 42, layout.width, 34, colors::BLACK);
+        m5.display.set_text_color(colors::WHITE, colors::BLACK);
+        m5.display.set_text_size(3);
+        let pct_text = if level.is_some() {
+            format!("{pct}%")
+        } else {
+            "--%".to_owned()
+        };
+        let pct_text_w = pct_text.len() as i32 * 18;
+        m5.display
+            .set_cursor(((layout.width - pct_text_w) / 2).max(0), layout.body_y - 38);
+        m5.display.println(&pct_text)?;
     }
 
     Ok(())
+}
+
+fn charging_sweep_pct(pct: u8, frame: u8) -> i32 {
+    let base = pct as i32;
+    if base >= 100 {
+        return 100;
+    }
+
+    let step =
+        (frame as i32 % (BATTERY_CHARGING_SWEEP_STEPS + 4)).min(BATTERY_CHARGING_SWEEP_STEPS);
+    base + ((100 - base) * step) / BATTERY_CHARGING_SWEEP_STEPS
 }
 
 fn render_status(m5: &mut M5Unified, message: &str) -> Result<()> {
