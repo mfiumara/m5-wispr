@@ -1,0 +1,49 @@
+[package]
+name = "m5-wispr"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+esp-idf-sys = { version = "0.37.2", default-features = false, features = ["std", "binstart"] }
+esp-idf-svc = { version = "0.52.1", default-features = false, features = ["std", "embassy-sync"] }
+esp32-nimble = "0.12.0"
+log = "0.4"
+m5unified = { path = "../m5unified-rs/crates/m5unified" }
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }
+
+[patch.crates-io]
+esp32-nimble = { path = "vendor/esp32-nimble" }
+
+[package.metadata.esp-idf-sys]
+esp_idf_version = "tag:v5.1.6"
+esp_idf_components = [
+    # Required by esp-idf-sys' generated probe project.
+    "main",
+    "bt",
+    "m5unified-rs",
+    "M5Unified",
+    "M5GFX",
+    "driver",
+    "esp_adc",
+    "esp_event",
+    "esp_timer",
+    "fatfs",
+    "nvs_flash",
+    "pthread",
+    "sdmmc",
+    "spiffs",
+]
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["components"]
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[profile.release]
+opt-level = "s"
