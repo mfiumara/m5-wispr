@@ -197,7 +197,11 @@ impl BLEHIDDevice {
 
     /// Set the battery level characteristic value.
     pub fn set_battery_level(&mut self, level: u8) {
-        self.battery_level_characteristic.lock().set_value(&[level]);
+        let mut battery_level_characteristic = self.battery_level_characteristic.lock();
+        if battery_level_characteristic.value_mut().as_slice() != [level].as_slice() {
+            battery_level_characteristic.set_value(&[level]);
+            battery_level_characteristic.notify();
+        }
     }
 
     /// Returns a pointer to the HID service.

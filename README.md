@@ -9,6 +9,10 @@ Behavior:
 - Button A held: hold the Wispr trigger key down, wake the LCD, show an audio-reactive colorful recording animation, and stream 16 kHz mono signed 16-bit PCM over BLE GATT notifications.
 - Button A released: stop the PCM stream, release the trigger key, show battery level briefly, then sleep the LCD again to save power.
 - Idle: LCD backlight is off and the display is in sleep / power-save mode.
+- After 60 seconds without a recording, the ESP32 enters deep sleep and BLE
+  disconnects. Hold Button A to wake, reconnect, and record.
+- USB-C power suspends the shutdown timer. A fresh 60-second countdown starts
+  when USB-C is disconnected.
 
 ## Important macOS Notes
 

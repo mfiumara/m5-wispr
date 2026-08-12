@@ -38,8 +38,18 @@ const DISPLAY_BRIGHTNESS: u8 = 96;
 const BATTERY_DISPLAY_MS: u64 = 2_500;
 const BATTERY_REFRESH_MS: u64 = 1_000;
 const BATTERY_CHARGING_REFRESH_MS: u64 = 250;
-const BATTERY_CHARGING_SWEEP_STEPS: i32 = 12;
-const IDLE_LOOP_MS: u32 = 20;
+const BATTERY_CHARGING_WAVE_AMP: i32 = 4;
+const BATTERY_EMPTY_MV: u16 = 3_300;
+const BATTERY_FULL_MV: u16 = 4_200;
+const USB_CONNECTED_MIN_MV: u16 = 4_000;
+const BLE_BATTERY_REFRESH_MS: u64 = 30_000;
+const ACTIVE_IDLE_LOOP_MS: u32 = 20;
+const SLEEPING_IDLE_LOOP_MS: u32 = 50;
+const DEEP_SLEEP_IDLE_SECS: u64 = 60;
+const BUTTON_A_GPIO: esp_idf_sys::gpio_num_t = esp_idf_sys::gpio_num_t_GPIO_NUM_11;
+const POWER_MANAGEMENT_MAX_FREQ_MHZ: i32 = 160;
+const POWER_MANAGEMENT_MIN_FREQ_MHZ: i32 = 40;
+const RECORDING_PM_LOCK_NAME: &[u8] = b"recording\0";
 
 // The recording animation is a pre-rendered gif: portrait full-screen frames
 // cropped around Jigglypuff's face, stored as swap565 (big-endian RGB565), the
@@ -141,10 +151,57 @@ struct BlePeripherals {
     audio_stream: Arc<Mutex<BLECharacteristic>>,
     sequence: u32,
     key_down: bool,
+    battery_level: Option<u8>,
+}
+
+struct PowerManagementLock {
+    handle: esp_idf_sys::esp_pm_lock_handle_t,
+    acquired: bool,
+}
+
+impl PowerManagementLock {
+    fn new() -> Result<Self> {
+        let mut handle = core::ptr::null_mut();
+        esp_idf_sys::esp!(unsafe {
+            esp_idf_sys::esp_pm_lock_create(
+                esp_idf_sys::esp_pm_lock_type_t_ESP_PM_CPU_FREQ_MAX,
+                0,
+                RECORDING_PM_LOCK_NAME.as_ptr().cast(),
+                &mut handle,
+            )
+        })?;
+
+        Ok(Self {
+            handle,
+            acquired: false,
+        })
+    }
+
+    fn acquire(&mut self) -> Result<()> {
+        if !self.acquired {
+            esp_idf_sys::esp!(unsafe { esp_idf_sys::esp_pm_lock_acquire(self.handle) })?;
+            self.acquired = true;
+        }
+        Ok(())
+    }
+
+    fn release(&mut self) {
+        if self.acquired {
+            let _ = esp_idf_sys::esp!(unsafe { esp_idf_sys::esp_pm_lock_release(self.handle) });
+            self.acquired = false;
+        }
+    }
+}
+
+impl Drop for PowerManagementLock {
+    fn drop(&mut self) {
+        self.release();
+        let _ = esp_idf_sys::esp!(unsafe { esp_idf_sys::esp_pm_lock_delete(self.handle) });
+    }
 }
 
 impl BlePeripherals {
-    fn new() -> Result<Self> {
+    fn new(initial_battery_level: Option<u8>) -> Result<Self> {
         let device = BLEDevice::take();
         BLEDevice::set_device_name(DEVICE_NAME)?;
         device
@@ -177,7 +234,8 @@ impl BlePeripherals {
         hid.pnp(0x02, 0x303a, 0x4001, 0x0100);
         hid.hid_info(0x00, 0x01);
         hid.report_map(HID_REPORT_DESCRIPTOR);
-        hid.set_battery_level(100);
+        let battery_level = initial_battery_level.unwrap_or(0).min(100);
+        hid.set_battery_level(battery_level);
 
         let audio_service_uuid = uuid128!("b3d7f070-3f2d-4c2e-94b8-1f0a95b7a100");
         let audio_service = server.create_service(audio_service_uuid);
@@ -210,11 +268,19 @@ impl BlePeripherals {
             audio_stream,
             sequence: 0,
             key_down: false,
+            battery_level: Some(battery_level),
         })
     }
 
     fn set_battery_level(&mut self, level: Option<u8>) {
-        self.hid.set_battery_level(level.unwrap_or(0));
+        let Some(level) = level.map(|level| level.min(100)) else {
+            return;
+        };
+
+        if self.battery_level != Some(level) {
+            self.hid.set_battery_level(level);
+            self.battery_level = Some(level);
+        }
     }
 
     fn set_hotkey(&mut self, pressed: bool) {
@@ -264,8 +330,8 @@ fn main() -> Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let mut m5 = M5Unified::begin_with_config(&m5_config())?;
+    configure_power_management()?;
     m5.display.set_rotation(0);
-    m5.power.set_led(0);
 
     let mut mic_cfg = m5.mic.config();
     mic_cfg.sample_rate = SAMPLE_RATE_HZ;
@@ -275,22 +341,28 @@ fn main() -> Result<()> {
 
     sleep_display(&mut m5);
 
-    let mut ble = BlePeripherals::new()?;
+    let mut ble = BlePeripherals::new(read_battery_level(&m5))?;
+    let mut recording_pm_lock = PowerManagementLock::new()?;
     let mut samples = [0_i16; AUDIO_SAMPLES_PER_PACKET];
     let mut recording = false;
     let mut pending_start_flag = false;
     let mut battery_screen_visible = false;
     let mut battery_hide_at: Option<Instant> = None;
     let mut last_battery_refresh = Instant::now() - Duration::from_secs(60);
+    let mut last_ble_battery_refresh =
+        Instant::now() - Duration::from_millis(BLE_BATTERY_REFRESH_MS);
     let mut battery_charge_frame = 0_u8;
     let mut last_battery_level: Option<Option<u8>> = None;
     let mut gif_player = RecordingGifPlayer::new(Instant::now());
+    let mut last_activity = Instant::now();
 
     loop {
         m5.update();
         let pressed = m5.buttons.a().is_pressed();
 
         if pressed && !recording {
+            last_activity = Instant::now();
+            recording_pm_lock.acquire()?;
             recording = true;
             pending_start_flag = true;
             battery_screen_visible = false;
@@ -313,7 +385,9 @@ fn main() -> Result<()> {
             m5.mic.end();
             ble.send_stop_marker();
             ble.set_hotkey(false);
+            recording_pm_lock.release();
             let now = Instant::now();
+            last_activity = now;
             let (charging, level) = render_battery(&mut m5, &mut ble, battery_charge_frame)?;
             last_battery_level = Some(level);
             battery_screen_visible = true;
@@ -355,10 +429,47 @@ fn main() -> Result<()> {
             &mut battery_charge_frame,
             &mut last_battery_level,
         )?;
+        refresh_ble_battery_level(&m5, &mut ble, &mut last_ble_battery_refresh);
 
-        // Keep the idle path light; BLE advertising and connections run in host tasks.
-        FreeRtos::delay_ms(IDLE_LOOP_MS);
+        if usb_power_connected(&m5) {
+            // Keep the full idle grace period available after USB is removed.
+            last_activity = Instant::now();
+        } else if last_activity.elapsed() >= Duration::from_secs(DEEP_SLEEP_IDLE_SECS) {
+            enter_deep_sleep(&mut m5)?;
+        }
+
+        // BLE advertising and connections run in host tasks; keep idle polling modest.
+        FreeRtos::delay_ms(if battery_screen_visible {
+            ACTIVE_IDLE_LOOP_MS
+        } else {
+            SLEEPING_IDLE_LOOP_MS
+        });
     }
+}
+
+fn configure_power_management() -> Result<()> {
+    let config = esp_idf_sys::esp_pm_config_t {
+        max_freq_mhz: POWER_MANAGEMENT_MAX_FREQ_MHZ,
+        min_freq_mhz: POWER_MANAGEMENT_MIN_FREQ_MHZ,
+        light_sleep_enable: false,
+    };
+
+    esp_idf_sys::esp!(unsafe {
+        esp_idf_sys::esp_pm_configure((&config as *const _) as *const core::ffi::c_void)
+    })?;
+    Ok(())
+}
+
+fn enter_deep_sleep(m5: &mut M5Unified) -> Result<()> {
+    sleep_display(m5);
+    // M5Unified's set_led is a no-op on StickS3; M5PM1 PWR_CFG bit 4
+    // controls the status LED level retained while the ESP32 sleeps.
+    m5.in_i2c.bit_off(0x6e, 0x06, 1 << 4, 100_000);
+    esp_idf_sys::esp!(unsafe { esp_idf_sys::esp_sleep_enable_ext0_wakeup(BUTTON_A_GPIO, 0) })?;
+    log::info!("idle for {DEEP_SLEEP_IDLE_SECS}s; sleeping until Button A is held");
+    FreeRtos::delay_ms(50);
+
+    unsafe { esp_idf_sys::esp_deep_sleep_start() }
 }
 
 fn m5_config() -> M5UnifiedConfig {
@@ -420,6 +531,16 @@ fn render_recording_frame(m5: &mut M5Unified, frame: usize) -> Result<()> {
         .push_image_rgb565(rect, recording_gif_frame(frame))
         .map_err(|error| anyhow!("push recording gif frame {frame}: {error:?}"))?;
     Ok(())
+}
+
+fn refresh_ble_battery_level(m5: &M5Unified, ble: &mut BlePeripherals, last_refresh: &mut Instant) {
+    let now = Instant::now();
+    if now.duration_since(*last_refresh) < Duration::from_millis(BLE_BATTERY_REFRESH_MS) {
+        return;
+    }
+
+    ble.set_battery_level(read_battery_level(m5));
+    *last_refresh = now;
 }
 
 fn refresh_battery_screen(
@@ -497,7 +618,32 @@ fn refresh_battery_screen(
 }
 
 fn battery_charging_indicator_active(m5: &M5Unified) -> bool {
-    m5.power.vbus_voltage_mv().map_or(false, |mv| mv >= 4_000) || m5.power.is_charging()
+    usb_power_connected(m5) || m5.power.is_charging()
+}
+
+fn usb_power_connected(m5: &M5Unified) -> bool {
+    m5.power
+        .vbus_voltage_mv()
+        .map_or(false, |mv| mv >= USB_CONNECTED_MIN_MV)
+}
+
+fn read_battery_level(m5: &M5Unified) -> Option<u8> {
+    m5.power
+        .battery_level()
+        .map(|level| level.min(100))
+        .or_else(|| m5.power.battery_voltage_mv().map(estimate_battery_level))
+}
+
+fn estimate_battery_level(mv: u16) -> u8 {
+    if mv <= BATTERY_EMPTY_MV {
+        return 0;
+    }
+
+    if mv >= BATTERY_FULL_MV {
+        return 100;
+    }
+
+    (((mv - BATTERY_EMPTY_MV) as u32 * 100) / (BATTERY_FULL_MV - BATTERY_EMPTY_MV) as u32) as u8
 }
 
 struct BatteryLayout {
@@ -531,7 +677,7 @@ fn render_battery(
     charge_frame: u8,
 ) -> Result<(bool, Option<u8>)> {
     wake_display(m5);
-    let level = m5.power.battery_level();
+    let level = read_battery_level(m5);
     ble.set_battery_level(level);
 
     let layout = battery_layout(m5);
@@ -564,7 +710,7 @@ fn update_battery_charge_fill(
     frame: u8,
     last_level: &mut Option<Option<u8>>,
 ) -> Result<bool> {
-    let level = m5.power.battery_level();
+    let level = read_battery_level(m5);
     ble.set_battery_level(level);
     let charging = battery_charging_indicator_active(m5);
     let layout = battery_layout(m5);
@@ -584,11 +730,6 @@ fn draw_battery_contents(
     redraw_text: bool,
 ) -> Result<()> {
     let pct = level.unwrap_or(0).min(100);
-    let displayed_pct = if charging {
-        charging_sweep_pct(pct, charge_frame)
-    } else {
-        pct as i32
-    };
     let fill_color = if charging {
         colors::GREEN
     } else if pct <= 20 {
@@ -603,13 +744,38 @@ fn draw_battery_contents(
     let inner_y = layout.body_y + 4;
     let inner_w = layout.body_w - 8;
     let inner_h = layout.body_h - 8;
-    let fill_w = (inner_w * displayed_pct) / 100;
+    let fill_w = (inner_w * pct as i32) / 100;
 
     m5.display
         .fill_rect(inner_x, inner_y, inner_w, inner_h, colors::BLACK);
     if fill_w > 0 {
-        m5.display
-            .fill_rect(inner_x, inner_y, fill_w, inner_h, fill_color);
+        if charging && fill_w < inner_w {
+            // Liquid surface: per-row triangle-wave offset on the fill edge,
+            // scrolled by charge_frame so it sloshes upward.
+            let solid_w = (fill_w - BATTERY_CHARGING_WAVE_AMP).max(0);
+            if solid_w > 0 {
+                m5.display
+                    .fill_rect(inner_x, inner_y, solid_w, inner_h, fill_color);
+            }
+            // One sine period, 0..=2*AMP, 16 samples.
+            const WAVE: [i32; 16] = [4, 6, 7, 8, 8, 8, 7, 6, 4, 2, 1, 0, 0, 0, 1, 2];
+            for row in 0..inner_h {
+                let wave = WAVE[(row / 2 + charge_frame as i32).rem_euclid(16) as usize];
+                let edge = (fill_w - BATTERY_CHARGING_WAVE_AMP + wave).clamp(0, inner_w);
+                if edge > solid_w {
+                    m5.display.fill_rect(
+                        inner_x + solid_w,
+                        inner_y + row,
+                        edge - solid_w,
+                        1,
+                        fill_color,
+                    );
+                }
+            }
+        } else {
+            m5.display
+                .fill_rect(inner_x, inner_y, fill_w, inner_h, fill_color);
+        }
     }
 
     if redraw_text {
@@ -629,17 +795,6 @@ fn draw_battery_contents(
     }
 
     Ok(())
-}
-
-fn charging_sweep_pct(pct: u8, frame: u8) -> i32 {
-    let base = pct as i32;
-    if base >= 100 {
-        return 100;
-    }
-
-    let step =
-        (frame as i32 % (BATTERY_CHARGING_SWEEP_STEPS + 4)).min(BATTERY_CHARGING_SWEEP_STEPS);
-    base + ((100 - base) * step) / BATTERY_CHARGING_SWEEP_STEPS
 }
 
 fn render_status(m5: &mut M5Unified, message: &str) -> Result<()> {
