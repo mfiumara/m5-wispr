@@ -14,6 +14,15 @@ Behavior:
 - USB-C power suspends the shutdown timer. A fresh 60-second countdown starts
   when USB-C is disconnected.
 
+Host bridges:
+
+- [macOS](macos-bridge/README.md): CoreBluetooth/CoreAudio with an existing
+  loopback device such as BlackHole.
+- [Windows](windows-bridge/README.md): native Windows BLE with an existing
+  virtual cable such as VB-CABLE.
+- [Linux](linux-bridge/README.md): BlueZ via Bleak and PipeWire/PulseAudio.
+  Wispr Flow itself does not currently provide a native Linux app.
+
 ## Important macOS Notes
 
 The HID trigger is sent as held `Right Option` by default (`WISPR_HOTKEY_MODIFIERS = 0x40`, `WISPR_HOTKEY_USAGE = 0x00` in `src/main.rs`). Apple Fn/Globe is not a normal external BLE HID keyboard key, and normal keys such as Space can auto-repeat while held, so configure Wispr Flow to use Option as its hold key or change the constants in `src/main.rs`.
