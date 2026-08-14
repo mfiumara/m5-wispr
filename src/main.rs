@@ -33,6 +33,8 @@ const HID_KEY_NONE: u8 = 0x00;
 const HID_MOD_RIGHT_OPTION: u8 = 0x40;
 const WISPR_HOTKEY_USAGE: u8 = HID_KEY_NONE;
 const WISPR_HOTKEY_MODIFIERS: u8 = HID_MOD_RIGHT_OPTION;
+const HOTKEY_RELEASE_REPEATS: u8 = 3;
+const HOTKEY_REPORT_INTERVAL_MS: u32 = 8;
 
 const DISPLAY_BRIGHTNESS: u8 = 96;
 const BATTERY_DISPLAY_MS: u64 = 2_500;
@@ -294,9 +296,12 @@ impl BlePeripherals {
             keyboard_report(0, 0)
         };
 
-        self.keyboard_input.lock().set_value(&report).notify();
+        let repeats = if pressed { 1 } else { HOTKEY_RELEASE_REPEATS };
+        for _ in 0..repeats {
+            self.keyboard_input.lock().set_value(&report).notify();
+            FreeRtos::delay_ms(HOTKEY_REPORT_INTERVAL_MS);
+        }
         self.key_down = pressed;
-        FreeRtos::delay_ms(7);
     }
 
     fn send_audio_packet(&mut self, samples: &[i16], flags: u8) {
@@ -383,8 +388,9 @@ fn main() -> Result<()> {
             recording = false;
             pending_start_flag = false;
             m5.mic.end();
-            ble.send_stop_marker();
+            // Release the host hotkey before queuing the final audio packet.
             ble.set_hotkey(false);
+            ble.send_stop_marker();
             recording_pm_lock.release();
             let now = Instant::now();
             last_activity = now;

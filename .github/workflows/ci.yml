@@ -38,3 +38,25 @@ jobs:
 
       - name: Build bridge
         run: swift build --package-path macos-bridge
+
+  linux-bridge:
+    name: Linux Bridge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check bridge
+        run: |
+          python3 -m py_compile linux-bridge/m5wispr_bridge.py
+          python3 linux-bridge/test_protocol.py
+
+  windows-bridge:
+    name: Windows Bridge
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and test bridge
+        run: dotnet run --project windows-bridge -c Release -- --self-test
